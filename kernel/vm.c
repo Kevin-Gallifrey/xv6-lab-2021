@@ -15,6 +15,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+extern int referCount[];
+
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -303,7 +305,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,14 +313,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    *pte = *pte & (~PTE_W);   // Clear PTE_W in the PTEs
+    *pte = *pte | PTE_COW;    // Set PTE_COW flag
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      // kfree(mem);
       goto err;
     }
+    referCount[(pa - KERNBASE) / PGSIZE]++;
   }
   return 0;
 
@@ -350,6 +355,12 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(isCowPageFault(pagetable, va0) == 0){
+      if(cowAlloc(pagetable, va0) != 0){
+        printf("cowAlloc fail\n");
+        return -1;
+      }
+    }
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -431,4 +442,52 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int
+isCowPageFault(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA)
+    return -1;
+  pte_t *pte;
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  return 0;
+}
+
+int
+cowAlloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa, a;
+  uint flags;
+  char *mem;
+  a = PGROUNDDOWN(va);
+  pte = walk(pagetable, a, 0);
+  pa = PTE2PA(*pte);
+  *pte = *pte | PTE_W;         // Set PTE_W in the PTEs
+  *pte = *pte & (~PTE_COW);    // Clear PTE_COW flag
+  flags = PTE_FLAGS(*pte);
+  if((mem = kalloc()) == 0)
+    return -1;
+    
+  memmove(mem, (char*)pa, PGSIZE);
+  uvmunmap(pagetable, a, 1, 1);
+  if(mappages(pagetable, a, PGSIZE, (uint64)mem, flags) != 0){
+    kfree(mem);
+    return -1;
+  }
+  return 0;
+
+  // cowAlloc failure will cause the process to be killed.
+  // there's no need to call uvmunmap(), freeproc() will do it.
+  // err:
+  //  uvmunmap(pagetable, a, 1, 1);
+  //  return -1;
 }
