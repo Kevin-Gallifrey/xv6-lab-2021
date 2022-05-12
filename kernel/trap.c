@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -15,6 +19,8 @@ extern char trampoline[], uservec[], userret[];
 void kernelvec();
 
 extern int devintr();
+
+int mmapHandler(uint64);
 
 void
 trapinit(void)
@@ -67,6 +73,14 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15){
+    uint64 va = r_stval();
+    if(mmapHandler(va) < 0)
+    {
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      p->killed = 1;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
@@ -218,3 +232,59 @@ devintr()
   }
 }
 
+int
+mmapHandler(uint64 va)
+{
+  struct proc *p = myproc();
+  struct VMA *vma;
+  struct file *f;
+  char *mem;
+  mem = kalloc();
+  if(mem == 0)
+  {
+    printf("kalloc failed\n");
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+
+  int i = 0;
+  for(i = 0; i < 16; i++)
+  {
+    vma = &(p->vma[i]);
+    if(va >= vma->addr && va < vma->addr + vma->length)
+      break;
+  }
+  if(i >= 16)
+  {
+    kfree(mem);
+    return -1;
+  }
+    
+  f = vma->f;
+  int offset = va - vma->addr + vma->offset;
+  ilock(f->ip);
+  if(readi(f->ip, 0, (uint64)mem, offset, PGSIZE) < 0)
+  {
+    kfree(mem);
+    printf("readi failed\n");
+    iunlock(f->ip);
+    return -1;
+  }
+  iunlock(f->ip);
+  
+  int pteflag = PTE_U;
+  if(vma->prot & PROT_READ)
+    pteflag |= PTE_R;
+  if(vma->prot & PROT_WRITE)
+    pteflag |= PTE_W;
+  if(vma->prot & PROT_EXEC)
+    pteflag |= PTE_X;
+
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, pteflag) != 0){
+    kfree(mem);
+    printf("mappages failed\n");
+    return -1;
+  }
+  
+  return 0;
+}

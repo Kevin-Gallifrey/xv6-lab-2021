@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -301,6 +302,14 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // Copy VMAs and increment the file reference count.
+  for(i = 0; i < 16; i++)
+    if(p->vma[i].f)
+    {
+      np->vma[i] = p->vma[i];
+      filedup(np->vma[i].f);
+    }
+      
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -343,6 +352,36 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // Unmap mmaped regions
+  struct VMA *vma;
+  for(int i = 0; i < 16; i++)
+  {
+    vma = &(p->vma[i]);
+    if(vma->f != 0)
+    {
+      int npages = PGROUNDUP(vma->length) / PGSIZE;
+      for(int j = 0; j < npages; j++)
+      {
+        if(walkaddr(p->pagetable, vma->addr) != 0)
+        {
+          if(vma->flag == MAP_SHARED)
+            filewrite(vma->f, vma->addr, PGSIZE);
+
+          uvmunmap(p->pagetable, PGROUNDDOWN(vma->addr), 1, 1);
+        }
+        vma->addr += PGSIZE;
+        vma->length -= PGSIZE;
+      }
+      
+      fileclose(vma->f);
+      vma->addr = 0;
+      vma->length = 0;
+      vma->flag = 0;
+      vma->prot = 0;
+      vma->offset = 0;
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
